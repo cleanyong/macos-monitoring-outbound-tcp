@@ -1,6 +1,7 @@
-use std::collections::HashMap;
-use std::io::{self, Write};
+use std::collections::{HashMap, HashSet};
+use std::io::{self, Write, BufRead, BufReader};
 use std::net::IpAddr;
+use std::fs::{File, OpenOptions};
 use std::process::Command;
 use std::thread;
 use std::time::Duration;
@@ -15,14 +16,27 @@ struct Connection {
 }
 
 fn main() {
+    // 如果命令行包含 "udp" (不區分大小寫)，則只監控 UDP；否則監控 TCP
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let monitor_udp = args.iter().any(|a| a.to_lowercase().contains("udp"));
+    let protocol_label = if monitor_udp { "UDP" } else { "TCP" };
+
+    let log_filename = if monitor_udp {
+        "mac-monitoring-stats-UDP.log"
+    } else {
+        "mac-monitoring-stats.log"
+    };
+
     let mut dns_cache: HashMap<String, String> = HashMap::new();
+    // 從已存在的統計檔中載入已經記錄過的行，避免跨次啟動重複寫入
+    let mut seen_lines: HashSet<String> = load_seen_lines(log_filename);
 
     loop {
-        match collect_connections() {
+        match collect_connections(monitor_udp) {
             Ok(conns) => {
                 // 像 top 一樣回到左上角，避免整個螢幕閃爍
                 print!("\x1b[H");
-                println!("Outbound TCP connections (updated every second)");
+                println!("Outbound {protocol} connections (updated every second)", protocol = protocol_label);
                 println!("(hostname is reverse-DNS of remote IP, cached)");
                 println!();
                 println!(
@@ -33,7 +47,9 @@ fn main() {
 
                 for c in conns {
                     let hostname = resolve_hostname(&c.remote_ip, &mut dns_cache);
-                    println!(
+
+                    // 這一行是螢幕上顯示的格式
+                    let line = format!(
                         "{:<8} {:<16} {:<16} {:<40} {:<18} {:<6}",
                         c.pid,
                         c.user,
@@ -42,6 +58,16 @@ fn main() {
                         c.remote_ip,
                         c.remote_port
                     );
+                    println!("{line}");
+
+                    // 以整行顯示內容作為 key, 只在第一次出現時寫入統計檔 (跨啟動也不重複)
+                    if !seen_lines.contains(&line) {
+                        if let Err(e) = append_stats_line(&line, log_filename) {
+                            eprintln!("Failed to write stats file: {e}");
+                        } else {
+                            seen_lines.insert(line.clone());
+                        }
+                    }
                 }
 
                 // 確保立刻刷新畫面
@@ -57,10 +83,26 @@ fn main() {
     }
 }
 
-fn collect_connections() -> Result<Vec<Connection>, String> {
-    // 使用 macOS 上常見的 lsof 來列出已建立的 TCP 連線
-    let output = Command::new("lsof")
-        .args(["-iTCP", "-sTCP:ESTABLISHED", "-n", "-P"])
+fn append_stats_line(line: &str, filename: &str) -> Result<(), String> {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(filename)
+        .map_err(|e| format!("open stats file error: {e}"))?;
+
+    writeln!(file, "{line}").map_err(|e| format!("write stats file error: {e}"))
+}
+
+fn collect_connections(monitor_udp: bool) -> Result<Vec<Connection>, String> {
+    // 使用 macOS 上常見的 lsof 來列出連線
+    let mut cmd = Command::new("lsof");
+    if monitor_udp {
+        cmd.args(["-iUDP", "-n", "-P"]);
+    } else {
+        cmd.args(["-iTCP", "-sTCP:ESTABLISHED", "-n", "-P"]);
+    }
+
+    let output = cmd
         .output()
         .map_err(|e| format!("failed to run lsof: {e}"))?;
 
@@ -130,6 +172,21 @@ fn collect_connections() -> Result<Vec<Connection>, String> {
     }
 
     Ok(conns)
+}
+
+fn load_seen_lines(filename: &str) -> HashSet<String> {
+    let mut set = HashSet::new();
+    if let Ok(file) = File::open(filename) {
+        let reader = BufReader::new(file);
+        for line in reader.lines() {
+            if let Ok(l) = line {
+                if !l.trim().is_empty() {
+                    set.insert(l);
+                }
+            }
+        }
+    }
+    set
 }
 
 fn resolve_hostname(ip: &str, cache: &mut HashMap<String, String>) -> String {
